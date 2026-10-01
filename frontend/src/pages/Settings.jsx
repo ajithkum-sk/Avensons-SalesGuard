@@ -257,8 +257,10 @@ function RuleRow({ rule, onSave }) {
 
 function AddException({ rules, onAdded, onError }) {
   const [form, setForm] = useState({ rule_code: "R02_SAME_SALESMAN_DOUBLE_BILL", customer_code: "", note: "" });
+  const [busy, setBusy] = useState(false);
 
   const add = async () => {
+    setBusy(true);
     try {
       await api.addException({
         rule_code: form.rule_code,
@@ -269,36 +271,53 @@ function AddException({ rules, onAdded, onError }) {
       onAdded();
     } catch (err) {
       onError(err.message);
+    } finally {
+      setBusy(false);
     }
   };
 
   return (
-    <div className="toolbar single-line-toolbar" style={{ marginTop: 12 }}>
-      <div className="fields-straight">
-        <select
-          value={form.rule_code}
-          onChange={(e) => setForm({ ...form, rule_code: e.target.value })}
-          aria-label="Rule to skip"
-        >
-          {rules.map((r) => (
-            <option key={r.rule_code} value={r.rule_code}>{r.title}</option>
-          ))}
-        </select>
-        <input
-          placeholder="Customer code"
-          value={form.customer_code}
-          onChange={(e) => setForm({ ...form, customer_code: e.target.value })}
-        />
-        <input
-          placeholder="Why (optional)"
-          value={form.note}
-          onChange={(e) => setForm({ ...form, note: e.target.value })}
-          style={{ width: 240 }}
-        />
+    <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid var(--line)" }}>
+      <strong style={{ display: "block", marginBottom: 10, fontSize: 14 }}>Add a new exception</strong>
+      <div className="toolbar" style={{ justifyContent: "flex-start", flexWrap: "wrap", rowGap: 12 }}>
+        <label className="field-inline">
+          <span>Rule</span>
+          <select
+            value={form.rule_code}
+            onChange={(e) => setForm({ ...form, rule_code: e.target.value })}
+            aria-label="Rule to skip"
+            style={{ minWidth: 220 }}
+          >
+            {rules.map((r) => (
+              <option key={r.rule_code} value={r.rule_code}>{r.title}</option>
+            ))}
+          </select>
+        </label>
+        <label className="field-inline">
+          <span>Customer code</span>
+          <input
+            placeholder="e.g. AV1023"
+            value={form.customer_code}
+            onChange={(e) => setForm({ ...form, customer_code: e.target.value })}
+            style={{ width: 140 }}
+          />
+        </label>
+        <label className="field-inline">
+          <span>Why (optional)</span>
+          <input
+            placeholder="Reason for this exception"
+            value={form.note}
+            onChange={(e) => setForm({ ...form, note: e.target.value })}
+            style={{ width: 220 }}
+          />
+        </label>
+        <button className="primary" onClick={add} disabled={!form.customer_code.trim() || busy}>
+          {busy ? "Adding…" : "Add exception"}
+        </button>
       </div>
-      <button className="primary save-right-btn" onClick={add} disabled={!form.customer_code.trim()}>
-        Add exception
-      </button>
+      {!form.customer_code.trim() && (
+        <p className="note" style={{ marginTop: 6 }}>Enter a customer code to enable this button.</p>
+      )}
     </div>
   );
 }

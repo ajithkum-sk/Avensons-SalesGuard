@@ -40,3 +40,65 @@ class ExceptionIn(BaseModel):
 class NoteIn(BaseModel):
     author: str
     note: str
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+    role: Literal["superadmin", "manager", "salesperson"]
+
+
+class UserOut(BaseModel):
+    id: int
+    name: str | None = None
+    email: str | None = None
+    role: str
+
+
+class LoginOut(BaseModel):
+    token: str
+    user: UserOut
+
+
+class ForgotPasswordIn(BaseModel):
+    email: str
+
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    new_password: str
+
+
+class MessageOut(BaseModel):
+    message: str
+
+
+class CollectionIn(BaseModel):
+    customer_code: str
+    document_ids: list[int]
+    amount: float
+    payment_mode: Literal["cash", "upi", "cheque"]
+
+
+class ViolationNoteIn(BaseModel):
+    note: str
+
+
+class AdminUserIn(BaseModel):
+    name: str
+    email: str
+    role: Literal["superadmin", "manager", "salesperson"]
+    employee_id: str | None = None
+    phone: str | None = None
+
+
+class AdminUserUpdateIn(BaseModel):
+    name: str | None = None
+    email: str | None = None
+    role: Literal["superadmin", "manager", "salesperson"] | None = None
+    employee_id: str | None = None
+    phone: str | None = None
+
+
+class SetActiveIn(BaseModel):
+    active: bool

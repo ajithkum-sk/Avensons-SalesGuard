@@ -77,8 +77,8 @@ RULES["R01_DBN_OVERDUE"] = Rule(
 INSERT INTO sg.rule_violation ({VIOLATION_COLS})
 SELECT %(run_id)s, %(rule_code)s, s.customer_code, s.salesman_key, s.doc_key,
        s.document_no, s.document_date, s.amount, s.balance, s.eff_overdue, %(severity)s,
-       format('%%s %%s pending %%s days (>= %%s), balance Rs.%%s',
-              s.document_type, s.document_no, s.eff_overdue, %(days)s, s.balance),
+       format('%%s %%s pending %%s days, balance Rs.%%s',
+              s.document_type, s.document_no, s.eff_overdue, s.balance),
        jsonb_build_object('document_type', s.document_type, 'due_days', s.due_days,
                           'beat', s.raw_beat, 'trigger', 'dbn_age')
 FROM scope s
@@ -144,7 +144,7 @@ WITH stuck AS (   -- per customer: which salesman is badly overdue, and by how m
 )
 SELECT %(run_id)s, %(rule_code)s, f.customer_code, f.salesman_key, f.doc_key,
        f.document_no, f.document_date, f.amount, f.balance, f.eff_overdue, %(severity)s,
-       format('Billing continues while %%s is overdue %%s days (Rs.%%s) at the same shop',
+       format('Billing continues while %%s is overdue %%s days (Rs.%%s) at the same outlet',
               st.salesman_name, st.worst_overdue, round(st.stuck_balance)),
        jsonb_build_object('blocking_salesman', st.salesman_name,
                           'blocking_overdue_days', st.worst_overdue,
@@ -205,7 +205,7 @@ RULES["R05_UNDERPERFORMING_SALESMAN"] = Rule(
     "R05_UNDERPERFORMING_SALESMAN",
     f"""
 INSERT INTO sg.rule_violation ({VIOLATION_COLS})
-WITH performer AS (   -- salesman A: has a fresh bill on this shop
+WITH performer AS (   -- salesman A: has a fresh bill on this outlet
     SELECT customer_code, salesman_key, salesman_name,
            min(due_days) AS days_since_bill, max(document_date) AS latest_bill
     FROM scope
@@ -222,7 +222,7 @@ WITH performer AS (   -- salesman A: has a fresh bill on this shop
 )
 SELECT %(run_id)s, %(rule_code)s, l.customer_code, l.salesman_key, l.doc_key,
        l.document_no, l.document_date, l.amount, l.balance, l.eff_overdue, %(severity)s,
-       format('%%s billed this shop %%s day(s) ago; this bill is still uncollected after %%s days',
+       format('%%s billed this outlet %%s day(s) ago; this bill is still uncollected after %%s days',
               p.salesman_name, p.days_since_bill, l.eff_overdue),
        jsonb_build_object('peer_salesman', p.salesman_name,
                           'peer_latest_bill', p.latest_bill,
@@ -241,14 +241,15 @@ INSERT INTO sg.rule_violation ({VIOLATION_COLS})
 WITH billed AS (
     SELECT s.customer_code, sc.category, min(s.due_days) AS days_ago,
            max(s.doc_key) AS doc_key, max(s.document_no) AS document_no,
-           max(s.document_date) AS document_date, max(s.salesman_key) AS salesman_key
+           max(s.document_date) AS document_date, max(s.salesman_key) AS salesman_key,
+           max(s.amount) AS amount, max(s.balance) AS balance, max(s.eff_overdue) AS eff_overdue
     FROM scope s
     JOIN sg.salesman_category sc ON sc.salesman_key = s.salesman_key
     WHERE s.document_type = 'INV'
     GROUP BY 1,2
 ), recent AS (SELECT * FROM billed WHERE days_ago <= %(window_days)s)
 SELECT %(run_id)s, %(rule_code)s, r.customer_code, r.salesman_key, r.doc_key,
-       r.document_no, r.document_date, NULL, NULL, NULL, %(severity)s,
+       r.document_no, r.document_date, r.amount, r.balance, r.eff_overdue, %(severity)s,
        format('%%s billed %%s day(s) ago but %%s was not billed at this outlet',
               r.category, r.days_ago, a.expects_category),
        jsonb_build_object('billed_category', r.category,
@@ -364,13 +365,15 @@ INSERT INTO sg.rule_violation ({VIOLATION_COLS})
 WITH activity AS (
     SELECT customer_code, min(due_days) AS days_since_last_bill,
            max(due_days) AS days_since_first_bill,
-           max(doc_key) AS doc_key, max(salesman_key) AS salesman_key
+           max(doc_key) AS doc_key, max(salesman_key) AS salesman_key,
+           max(document_no) AS document_no, max(document_date) AS document_date,
+           max(amount) AS amount, max(balance) AS balance, max(eff_overdue) AS eff_overdue
     FROM scope
     WHERE document_type = 'INV'
     GROUP BY 1
 )
 SELECT %(run_id)s, %(rule_code)s, a.customer_code, a.salesman_key, a.doc_key,
-       NULL, NULL, NULL, NULL, NULL, %(severity)s,
+       a.document_no, a.document_date, a.amount, a.balance, a.eff_overdue, %(severity)s,
        format('No billing for %%s days at this outlet', a.days_since_last_bill),
        jsonb_build_object('days_since_last_bill', a.days_since_last_bill)
 FROM activity a
@@ -422,7 +425,9 @@ RULES["R17_BEAT_COVERAGE_GAP"] = Rule(
 INSERT INTO sg.rule_violation ({VIOLATION_COLS})
 WITH per_cust AS (
     SELECT beat_key, raw_beat, customer_code, min(due_days) AS days_since_bill,
-           max(doc_key) AS doc_key, max(salesman_key) AS salesman_key
+           max(doc_key) AS doc_key, max(salesman_key) AS salesman_key,
+           max(document_no) AS document_no, max(document_date) AS document_date,
+           max(amount) AS amount, max(balance) AS balance, max(eff_overdue) AS eff_overdue
     FROM scope
     WHERE document_type = 'INV' AND beat_key IS NOT NULL
     GROUP BY 1,2,3
@@ -431,7 +436,7 @@ WITH per_cust AS (
     FROM per_cust GROUP BY 1
 )
 SELECT %(run_id)s, %(rule_code)s, pc.customer_code, pc.salesman_key, pc.doc_key,
-       NULL, NULL, NULL, NULL, NULL, %(severity)s,
+       pc.document_no, pc.document_date, pc.amount, pc.balance, pc.eff_overdue, %(severity)s,
        format('Beat %%s was served %%s day(s) ago but this outlet was skipped for %%s days',
               pc.raw_beat, pb.beat_freshest, pc.days_since_bill),
        jsonb_build_object('beat', pc.raw_beat, 'beat_freshest_days', pb.beat_freshest,

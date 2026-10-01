@@ -5,10 +5,11 @@ export default function Dashboard({ summary, loading, onRefresh, onOpenRule, onB
   const [running, setRunning] = useState(false);
   const [msg, setMsg] = useState(null);
 
-  if (loading && !summary) return <div className="empty">Loading today's lists…</div>;
-  if (!summary) return null;
-
-  const { run, totals, by_rule, top_salesmen, top_customers } = summary;
+  const { runs, totals, by_rule, top_salesmen, top_customers } = summary;
+  const run = runs?.[0] ?? null;
+  if (!run) {
+  return <div className="empty">No completed rule check for this selection yet — load a report and check it from Uploads.</div>;
+  }
   const worst = Math.max(...by_rule.map((r) => Number(r.exposure) || 0), 1);
 
   const rerun = async () => {

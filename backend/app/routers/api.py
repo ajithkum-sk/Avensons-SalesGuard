@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 
 from ..db import fetch_all, fetch_one, execute, conn
-from ..ingest import load_snapshot
+from ..ingest import load_snapshot, load_sales_register
 from ..rules import RULES, RuleFailure, run_rules
 from ..schemas import (ExceptionIn, GlobalConfigIn, NoteIn, RuleParamsIn, RunRequest)
 
@@ -25,8 +25,12 @@ router = APIRouter(prefix="/api")
 @router.get("/snapshots")
 def list_snapshots():
     return fetch_all(
-        """SELECT s.*, (SELECT count(*) FROM outstanding_document d
-                         WHERE d.snapshot_id = s.snapshot_id) AS documents
+        """SELECT s.*,
+                  CASE WHEN s.snapshot_type = 'monthly'
+                       THEN s.row_count
+                       ELSE (SELECT count(*) FROM outstanding_document d
+                              WHERE d.snapshot_id = s.snapshot_id)
+                  END AS documents
            FROM snapshot s ORDER BY snapshot_date DESC, snapshot_id DESC"""
     )
 
@@ -36,6 +40,7 @@ async def upload_snapshot(
     file: UploadFile = File(...),
     snapshot_type: str = Form("daily"),
     snapshot_date: str | None = Form(None),
+    location_id: int | None = Form(None),
     run_rules_after: bool = Form(True),
 ):
     if not file.filename.lower().endswith((".xlsx", ".xls", ".xlsm")):
@@ -43,18 +48,23 @@ async def upload_snapshot(
     tmp = Path(tempfile.mkdtemp()) / file.filename
     with tmp.open("wb") as fh:
         shutil.copyfileobj(file.file, fh)
+    def _parse_snapshot_date(s: str) -> date:
+        if len(s) == 7:  # "YYYY-MM" from a month-only picker
+            s = f"{s}-01"
+        return date.fromisoformat(s)
+
+    parsed_date = _parse_snapshot_date(snapshot_date) if snapshot_date else None
     try:
-        loaded = load_snapshot(
-            tmp,
-            snapshot_date=date.fromisoformat(snapshot_date) if snapshot_date else None,
-            snapshot_type=snapshot_type,
-        )
+        if snapshot_type == "monthly":
+            loaded = load_sales_register(tmp, snapshot_date=parsed_date, location_id=location_id)
+        else:
+            loaded = load_snapshot(tmp, snapshot_date=parsed_date, snapshot_type=snapshot_type, location_id=location_id)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     finally:
         shutil.rmtree(tmp.parent, ignore_errors=True)
 
-    if run_rules_after:
+    if run_rules_after and snapshot_type != "monthly":
         loaded["run"] = _run(loaded["snapshot_id"], None)
     return loaded
 
@@ -63,7 +73,10 @@ async def upload_snapshot(
 
 def _run(snapshot_id: int | None, only: list[str] | None):
     if snapshot_id is None:
-        row = fetch_one("SELECT snapshot_id FROM snapshot ORDER BY snapshot_date DESC, snapshot_id DESC LIMIT 1")
+        row = fetch_one(
+            "SELECT snapshot_id FROM snapshot WHERE snapshot_type != 'monthly' "
+            "ORDER BY snapshot_date DESC, snapshot_id DESC LIMIT 1"
+        )
         if not row:
             raise HTTPException(409, "No snapshot loaded yet - upload an outstanding file first")
         snapshot_id = row["snapshot_id"]
@@ -96,62 +109,114 @@ def _latest_run_id() -> int:
     return row["run_id"]
 
 
+def _run_ids_for_locations(location_ids: list[int] | None) -> list[int]:
+    """Latest successful run per requested location. No location_ids = every
+    location that has a successful run. Combining multiple locations assumes
+    customer codes are not shared across locations - if the same outlet ever
+    appears in two locations' files, its money totals would be counted twice."""
+    if location_ids:
+        where = "AND s.location_id = ANY(%(loc)s)"
+        args = {"loc": location_ids}
+    else:
+        where = ""
+        args = {}
+    rows = fetch_all(
+        f"""SELECT DISTINCT ON (s.location_id) r.run_id
+            FROM rule_run r JOIN snapshot s USING (snapshot_id)
+            WHERE r.status = 'success' {where}
+            ORDER BY s.location_id, r.run_id DESC""",
+        args,
+    )
+    run_ids = [r["run_id"] for r in rows]
+    if not run_ids:
+        raise HTTPException(409, "No successful rule run yet for the selected location(s)")
+    return run_ids
+
+
 # ------------------------------------------------------------------ dashboard
 
 @router.get("/dashboard")
-def dashboard(run_id: int | None = None):
-    run_id = run_id or _latest_run_id()
-    run = fetch_one(
-        """SELECT r.*, s.snapshot_date, s.snapshot_type, s.source_file
-           FROM rule_run r JOIN snapshot s USING (snapshot_id) WHERE run_id=%s""",
-        (run_id,),
+def dashboard(run_id: int | None = None, location_id: list[int] | None = Query(None)):
+    run_ids = [run_id] if run_id else _run_ids_for_locations(location_id)
+    runs = fetch_all(
+        """SELECT r.*, s.snapshot_date, s.snapshot_type, s.source_file, s.location_id,
+                  l.name AS location_name
+           FROM rule_run r JOIN snapshot s USING (snapshot_id)
+           LEFT JOIN location l ON l.location_id = s.location_id
+           WHERE r.run_id = ANY(%(run_ids)s) ORDER BY r.run_id""",
+        {"run_ids": run_ids},
     )
     by_rule = fetch_all(
         """SELECT ru.rule_code, ru.title, ru.purpose, ru.data_note, ru.audience,
                   ru.rule_group, ru.severity, ru.is_enabled,
-                  d.status, coalesce(d.hits,0) AS hits, d.ms, d.message,
+                  bool_and(coalesce(d.status,'skipped') != 'skipped') AS ran,
+                  coalesce(sum(d.hits),0) AS hits,
                   (SELECT count(DISTINCT v.customer_code) FROM rule_violation v
-                    WHERE v.run_id=%s AND v.rule_code=ru.rule_code) AS customers,
+                    WHERE v.run_id = ANY(%(run_ids)s) AND v.rule_code=ru.rule_code) AS customers,
                   (SELECT coalesce(sum(v.balance),0) FROM rule_violation v
-                    WHERE v.run_id=%s AND v.rule_code=ru.rule_code) AS exposure
+                    WHERE v.run_id = ANY(%(run_ids)s) AND v.rule_code=ru.rule_code) AS exposure
            FROM rule ru
-           LEFT JOIN rule_run_detail d ON d.run_id=%s AND d.rule_code=ru.rule_code
+           LEFT JOIN rule_run_detail d ON d.run_id = ANY(%(run_ids)s) AND d.rule_code=ru.rule_code
+           GROUP BY ru.rule_code, ru.title, ru.purpose, ru.data_note, ru.audience,
+                    ru.rule_group, ru.severity, ru.is_enabled, ru.sort_order
            ORDER BY ru.sort_order""",
-        (run_id, run_id, run_id),
+        {"run_ids": run_ids},
     )
     totals = fetch_one(
         """SELECT count(*) AS violations,
                   count(DISTINCT customer_code) AS customers,
                   count(DISTINCT salesman_key) AS salesmen,
                   coalesce(sum(balance),0) AS exposure
-           FROM rule_violation WHERE run_id=%s""",
-        (run_id,),
+           FROM rule_violation WHERE run_id = ANY(%(run_ids)s)""",
+        {"run_ids": run_ids},
     )
     worst_salesmen = fetch_all(
         """SELECT s.salesman_name, s.salesman_type, count(*) AS flags,
                   coalesce(sum(v.balance),0) AS exposure
            FROM rule_violation v JOIN dim_salesman s USING (salesman_key)
-           WHERE v.run_id=%s GROUP BY 1,2 ORDER BY exposure DESC LIMIT 10""",
-        (run_id,),
+           WHERE v.run_id = ANY(%(run_ids)s) GROUP BY 1,2 ORDER BY exposure DESC LIMIT 10""",
+        {"run_ids": run_ids},
     )
     worst_customers = fetch_all(
         """SELECT v.customer_code, c.customer_name, c.channel_type, count(*) AS flags,
                   coalesce(sum(v.balance),0) AS exposure
            FROM rule_violation v JOIN dim_customer c USING (customer_code)
-           WHERE v.run_id=%s GROUP BY 1,2,3 ORDER BY exposure DESC LIMIT 10""",
-        (run_id,),
+           WHERE v.run_id = ANY(%(run_ids)s) GROUP BY 1,2,3 ORDER BY exposure DESC LIMIT 10""",
+        {"run_ids": run_ids},
     )
-    return {"run": run, "totals": totals, "by_rule": by_rule,
+    return {"runs": runs, "run_ids": run_ids, "totals": totals, "by_rule": by_rule,
             "top_salesmen": worst_salesmen, "top_customers": worst_customers}
 
 
 # ----------------------------------------------------------------- violations
 
-def _violation_query(run_id: int, rule_code: str | None, search: str | None,
+# only these columns may be used for sorting - never interpolate sort_by directly
+SORTABLE_COLUMNS = {
+    "customer_name": "customer_name",
+    "salesman_name": "salesman_name",
+    "document_no": "document_no",
+    "amount": "amount",
+    "balance": "balance",
+    "overdue_days": "overdue_days",
+    "reason": "reason",
+}
+
+
+def _violation_query(run_ids: list[int], rule_code: str | None, search: str | None,
                      salesman_key: int | None, severity: str | None,
-                     limit: int, offset: int):
-    where = ["run_id = %(run_id)s"]
-    args: dict = {"run_id": run_id, "limit": limit, "offset": offset}
+                     limit: int, offset: int,
+                     customer_search: str | None = None,
+                     salesman_search: str | None = None,
+                     min_overdue_days: int | None = None,
+                     max_overdue_days: int | None = None):
+    where = ["run_id = ANY(%(run_ids)s)"]
+    args: dict = {"run_ids": run_ids, "limit": limit, "offset": offset}
+    if min_overdue_days is not None:
+        where.append("overdue_days >= %(min_overdue_days)s")
+        args["min_overdue_days"] = min_overdue_days
+    if max_overdue_days is not None:
+        where.append("overdue_days <= %(max_overdue_days)s")
+        args["max_overdue_days"] = max_overdue_days
     if rule_code:
         where.append("rule_code = %(rule_code)s")
         args["rule_code"] = rule_code
@@ -165,49 +230,81 @@ def _violation_query(run_id: int, rule_code: str | None, search: str | None,
         where.append("(customer_name ILIKE %(q)s OR customer_code ILIKE %(q)s "
                      "OR salesman_name ILIKE %(q)s OR document_no ILIKE %(q)s)")
         args["q"] = f"%{search}%"
+    if customer_search:
+        where.append("(customer_name ILIKE %(customer_q)s OR customer_code ILIKE %(customer_q)s)")
+        args["customer_q"] = f"%{customer_search}%"
+    if salesman_search:
+        where.append("salesman_name ILIKE %(salesman_q)s")
+        args["salesman_q"] = f"%{salesman_search}%"
     clause = " AND ".join(where)
     return clause, args
+
+
+def _order_clause(sort_by: str | None, sort_dir: str | None) -> str:
+    if not sort_by or sort_by not in SORTABLE_COLUMNS:
+        return "ORDER BY balance DESC NULLS LAST, overdue_days DESC NULLS LAST"
+    direction = "DESC" if (sort_dir or "").lower() == "desc" else "ASC"
+    col = SORTABLE_COLUMNS[sort_by]
+    return f"ORDER BY {col} {direction} NULLS LAST"
 
 
 @router.get("/violations")
 def violations(
     run_id: int | None = None,
+    location_id: list[int] | None = Query(None),
     rule_code: str | None = None,
     search: str | None = None,
     salesman_key: int | None = None,
     severity: str | None = None,
+    customer_search: str | None = None,
+    salesman_search: str | None = None,
+    min_overdue_days: int | None = None,
+    max_overdue_days: int | None = None,
+    sort_by: str | None = None,
+    sort_dir: str | None = None,
     limit: int = Query(100, le=1000),
     offset: int = 0,
 ):
-    run_id = run_id or _latest_run_id()
-    clause, args = _violation_query(run_id, rule_code, search, salesman_key, severity, limit, offset)
+    run_ids = [run_id] if run_id else _run_ids_for_locations(location_id)
+    clause, args = _violation_query(run_ids, rule_code, search, salesman_key, severity, limit, offset,
+                                    customer_search, salesman_search, min_overdue_days, max_overdue_days)
+    order = _order_clause(sort_by, sort_dir)
     rows = fetch_all(
         f"""SELECT * FROM v_violation WHERE {clause}
-            ORDER BY balance DESC NULLS LAST, overdue_days DESC NULLS LAST
+            {order}
             LIMIT %(limit)s OFFSET %(offset)s""",
         args,
     )
     total = fetch_one(f"SELECT count(*) AS n, coalesce(sum(balance),0) AS exposure "
                       f"FROM v_violation WHERE {clause}", args)
-    return {"run_id": run_id, "total": total["n"], "exposure": total["exposure"], "rows": rows}
+    return {"run_ids": run_ids, "total": total["n"], "exposure": total["exposure"], "rows": rows}
 
 
 @router.get("/violations.csv")
 def violations_csv(
     run_id: int | None = None,
+    location_id: list[int] | None = Query(None),
     rule_code: str | None = None,
     search: str | None = None,
     salesman_key: int | None = None,
     severity: str | None = None,
+    customer_search: str | None = None,
+    salesman_search: str | None = None,
+    min_overdue_days: int | None = None,
+    max_overdue_days: int | None = None,
+    sort_by: str | None = None,
+    sort_dir: str | None = None,
 ):
-    run_id = run_id or _latest_run_id()
-    clause, args = _violation_query(run_id, rule_code, search, salesman_key, severity, 100000, 0)
+    run_ids = [run_id] if run_id else _run_ids_for_locations(location_id)
+    clause, args = _violation_query(run_ids, rule_code, search, salesman_key, severity, 100000, 0,
+                                    customer_search, salesman_search, min_overdue_days, max_overdue_days)
+    order = _order_clause(sort_by, sort_dir) if sort_by else "ORDER BY rule_code, balance DESC NULLS LAST"
     rows = fetch_all(
         f"""SELECT rule_code, rule_title, severity, customer_code, customer_name, channel_type,
                    salesman_name, salesman_type, raw_beat AS beat, document_no, document_date,
                    amount, balance, overdue_days, reason
             FROM v_violation WHERE {clause}
-            ORDER BY rule_code, balance DESC NULLS LAST""",
+            {order}""",
         args,
     )
     buf = io.StringIO()
@@ -215,7 +312,7 @@ def violations_csv(
     writer.writeheader()
     writer.writerows(rows)
     buf.seek(0)
-    name = f"salesguard_{rule_code or 'all'}_run{run_id}.csv"
+    name = f"salesguard_{rule_code or 'all'}_run{'-'.join(map(str, run_ids))}.csv"
     return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
                              headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
@@ -250,17 +347,17 @@ def customer_detail(customer_code: str, run_id: int | None = None):
 
 
 @router.get("/salesmen")
-def salesmen(run_id: int | None = None):
-    run_id = run_id or _latest_run_id()
+def salesmen(run_id: int | None = None, location_id: list[int] | None = Query(None)):
+    run_ids = [run_id] if run_id else _run_ids_for_locations(location_id)
     return fetch_all(
         """SELECT s.salesman_key, s.salesman_name, s.salesman_type,
                   count(v.violation_id) AS flags,
                   coalesce(sum(v.balance),0) AS exposure,
                   count(DISTINCT v.customer_code) AS customers
            FROM dim_salesman s
-           LEFT JOIN rule_violation v ON v.salesman_key=s.salesman_key AND v.run_id=%s
+           LEFT JOIN rule_violation v ON v.salesman_key=s.salesman_key AND v.run_id = ANY(%(run_ids)s)
            GROUP BY 1,2,3 ORDER BY exposure DESC""",
-        (run_id,),
+        {"run_ids": run_ids},
     )
 
 
@@ -379,3 +476,92 @@ def map_salesman(salesman_key: int, category: str):
             (salesman_key, category),
         )
     return {"salesman_key": salesman_key, "category": category}
+
+
+@router.get("/masters/locations")
+def list_locations():
+    return fetch_all("SELECT * FROM location ORDER BY name")
+
+
+@router.post("/masters/locations")
+def add_location(name: str):
+    existing = fetch_one("SELECT * FROM location WHERE name=%s", (name,))
+    if existing:
+        raise HTTPException(400, "That location already exists")
+    return fetch_one("INSERT INTO location (name) VALUES (%s) RETURNING *", (name,))
+
+
+@router.delete("/masters/locations/{location_id}")
+def delete_location(location_id: int):
+    n = execute("DELETE FROM location WHERE location_id=%s", (location_id,))
+    if n == 0:
+        raise HTTPException(404, "Location not found")
+    return {"location_id": location_id, "deleted": True}
+
+
+@router.delete("/snapshots/{snapshot_id}")
+def delete_snapshot(snapshot_id: int):
+    existing = fetch_one("SELECT snapshot_id FROM snapshot WHERE snapshot_id=%s", (snapshot_id,))
+    if not existing:
+        raise HTTPException(404, "Snapshot not found")
+    execute("DELETE FROM snapshot WHERE snapshot_id=%s", (snapshot_id,))
+    return {"snapshot_id": snapshot_id, "deleted": True}
+
+
+@router.get("/salesmen/monthly")
+def salesmen_monthly(month: str):
+    """Per-salesman sales performance for one calendar month, compared to
+    their own trailing 3-month average (same average logic as R16)."""
+    try:
+        month_start = date.fromisoformat(month)
+    except ValueError:
+        raise HTTPException(400, "month must be YYYY-MM-01")
+
+    current = fetch_all(
+        """SELECT salesman_key, sum(total_amount) AS amount, sum(invoice_count) AS invoices
+           FROM monthly_sales WHERE month_start = %s AND salesman_key IS NOT NULL
+           GROUP BY 1""",
+        (month_start,),
+    )
+    hist = fetch_all(
+        """SELECT salesman_key, sum(total_amount) / 3.0 AS avg_amount
+           FROM monthly_sales
+           WHERE month_start >= (%s::date - interval '3 months')
+             AND month_start < %s::date
+             AND salesman_key IS NOT NULL
+           GROUP BY 1""",
+        (month_start, month_start),
+    )
+    hist_by_key = {h["salesman_key"]: float(h["avg_amount"]) for h in hist}
+
+    smen = fetch_all("SELECT salesman_key, salesman_name, salesman_type FROM dim_salesman")
+    smen_by_key = {s["salesman_key"]: s for s in smen}
+
+    rows = []
+    for c in current:
+        key = c["salesman_key"]
+        info = smen_by_key.get(key, {})
+        avg = hist_by_key.get(key, 0)
+        rows.append({
+            "salesman_key": key,
+            "salesman_name": info.get("salesman_name", f"#{key}"),
+            "salesman_type": info.get("salesman_type"),
+            "amount": float(c["amount"]),
+            "invoices": c["invoices"],
+            "avg_amount": round(avg, 2),
+            "pct_of_avg": round(100 * float(c["amount"]) / avg, 1) if avg > 0 else None,
+        })
+    rows.sort(key=lambda r: r["amount"], reverse=True)
+
+    cats = fetch_all(
+        """SELECT ms.salesman_key, msc.category, sum(msc.total_amount) AS amount
+           FROM monthly_sales ms
+           JOIN outstanding_document d ON d.salesman_key = ms.salesman_key
+           JOIN monthly_sales_category msc ON msc.customer_code = d.customer_code
+                                            AND msc.month_start = ms.month_start
+           WHERE ms.month_start = %s
+           GROUP BY 1,2""",
+        (month_start,),
+    ) if False else []  # category-per-salesman needs a direct link; see note below
+
+    return {"month": month, "rows": rows}

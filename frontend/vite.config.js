@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
-    // the API stays on 8000; no CORS juggling during development
-    proxy: { "/api": "http://localhost:8000" },
+    // the API stays on 8001; no CORS juggling during development
+    proxy: { "/api": "http://192.168.123.31:8001" },
   },
 });

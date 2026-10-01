@@ -105,7 +105,10 @@ def read_outstanding(path: str | Path, sheet: int | str = 0) -> tuple[pd.DataFra
         df[col] = pd.to_numeric(df.get(col), errors="coerce")
     for col in ("customer_name", "channel_type", "outlet_type", "loyalty_program",
                 "salesman_name", "beat", "salesman_type", "invoice_status", "rule_book"):
-        df[col] = df.get(col).astype("string").str.strip()
+        if col in df.columns:
+            df[col] = df[col].astype("string").str.strip()
+        else:
+            df[col] = pd.array([None] * len(df), dtype="string")
     df["source_ignored"] = df["rule_book"].fillna("").str.upper().eq("IGNORE")
 
     # one source row per (customer, type, no) - the sheet occasionally repeats
@@ -133,6 +136,7 @@ def load_snapshot(
     snapshot_type: str = "daily",
     replace: bool = True,
     derive_monthly_sales: bool = True,
+    location_id: int | None = None,
 ) -> dict:
     """Load one outstanding file into the warehouse. Idempotent per (date, type)."""
     df, printed_at = read_outstanding(path)
@@ -145,9 +149,9 @@ def load_snapshot(
                 (snapshot_date, snapshot_type),
             )
         cur.execute(
-            """INSERT INTO snapshot (snapshot_date, snapshot_type, source_file, printed_at, row_count)
-               VALUES (%s,%s,%s,%s,%s) RETURNING snapshot_id""",
-            (snapshot_date, snapshot_type, Path(path).name, printed_at, len(df)),
+            """INSERT INTO snapshot (snapshot_date, snapshot_type, source_file, printed_at, row_count, location_id)
+               VALUES (%s,%s,%s,%s,%s,%s) RETURNING snapshot_id""",
+            (snapshot_date, snapshot_type, Path(path).name, printed_at, len(df), location_id),
         )
         snapshot_id = cur.fetchone()["snapshot_id"]
 
@@ -283,3 +287,145 @@ def _derive_monthly_sales(cur, snapshot_id: int) -> int:
         (snapshot_id,),
     )
     return cur.rowcount
+
+
+# ------------------------------------------------------------- sales register
+
+SALES_COLUMN_MAP = {
+    "cagetory": "category",
+    "category": "category",
+    "total": "amount",
+    "invoice no.": "invoice_no",
+    "invoice no": "invoice_no",
+    "invoice / sr  date": "doc_date",
+    "invoice / sr date": "doc_date",
+    "outlet id": "customer_code",
+    "outlet name": "customer_name",
+    "ds name": "salesman_name",
+}
+
+
+def _find_sales_header_row(path: Path, sheet) -> int:
+    probe = pd.read_excel(path, sheet_name=sheet, header=None, nrows=40, dtype=str)
+    for idx, row in probe.iterrows():
+        cells = {_norm(v) for v in row.tolist() if pd.notna(v)}
+        if "outlet id" in cells and "ds name" in cells:
+            return int(idx)
+    raise ValueError("Header row not found - is this a Sales Register - Itemwise export?")
+
+
+def _sales_date_range(path: Path, sheet) -> date | None:
+    probe = pd.read_excel(path, sheet_name=sheet, header=None, nrows=3, dtype=str)
+    for v in probe.fillna("").values.ravel():
+        m = re.search(r"From\s+(\d{2}/\d{2}/\d{4})\s+to\s+(\d{2}/\d{2}/\d{4})", str(v))
+        if m:
+            return datetime.strptime(m.group(2), "%d/%m/%Y").date()
+    return None
+
+
+def load_sales_register(
+    path: str | Path,
+    snapshot_date: date | None = None,
+    replace: bool = True,
+    location_id: int | None = None,
+) -> dict:
+    """Load a 'Sales Register - Itemwise' export into monthly_sales /
+    monthly_sales_category. Auto-creates any customer seen here but not yet
+    in dim_customer (paid-in-full outlets never appear in an outstanding file).
+    """
+    path = Path(path)
+    header_row = _find_sales_header_row(path, 0)
+    raw = pd.read_excel(path, sheet_name=0, header=header_row)
+    raw = raw.rename(columns={c: SALES_COLUMN_MAP.get(_norm(c), _norm(c)) for c in raw.columns})
+
+    required = {"customer_code", "salesman_name", "amount", "doc_date", "invoice_no"}
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"Missing expected columns: {sorted(missing)}")
+
+    df = raw.dropna(subset=["customer_code", "doc_date"]).copy()
+    df["customer_code"] = df["customer_code"].astype(str).str.strip()
+    df["customer_name"] = df.get("customer_name").astype("string").str.strip()
+    df["salesman_name"] = df.get("salesman_name").astype("string").str.strip()
+    df["category"] = df.get("category").astype("string").str.strip()
+    df["amount"] = _money(df["amount"])
+    df["doc_date"] = pd.to_datetime(df["doc_date"], errors="coerce").dt.date
+    df = df.dropna(subset=["doc_date"])
+    df["month_start"] = df["doc_date"].apply(lambda d: date(d.year, d.month, 1))
+
+    inferred_date = snapshot_date or _sales_date_range(path, 0) or date.today()
+
+    with conn() as c, c.cursor() as cur:
+        if replace:
+            cur.execute(
+                "DELETE FROM snapshot WHERE snapshot_date = %s AND snapshot_type = 'monthly'",
+                (inferred_date,),
+            )
+        cur.execute(
+            """INSERT INTO snapshot (snapshot_date, snapshot_type, source_file, row_count, location_id)
+               VALUES (%s,'monthly',%s,%s,%s) RETURNING snapshot_id""",
+            (inferred_date, path.name, len(df), location_id),
+        )
+        snapshot_id = cur.fetchone()["snapshot_id"]
+
+        # auto-create any customer this sales file mentions that we haven't seen yet
+        cur.execute("SELECT customer_code FROM dim_customer")
+        known = {r["customer_code"] for r in cur.fetchall()}
+        new_customers = (
+            df[~df["customer_code"].isin(known)]
+            .groupby("customer_code")["customer_name"].last().reset_index()
+        )
+        cur.executemany(
+            """INSERT INTO dim_customer (customer_code, customer_name, credit_term)
+               VALUES (%s,%s,0) ON CONFLICT (customer_code) DO NOTHING""",
+            list(new_customers.itertuples(index=False, name=None)),
+        )
+
+        cur.execute("SELECT salesman_name, salesman_key FROM dim_salesman")
+        sman_keys = {r["salesman_name"]: r["salesman_key"] for r in cur.fetchall()}
+
+        skipped_salesman = 0
+        cust_month: dict = {}
+        cat_month: dict = {}
+        for r in df.itertuples():
+            sman_key = sman_keys.get(r.salesman_name)
+            if r.salesman_name and sman_key is None:
+                skipped_salesman += 1
+                continue
+            key = (r.month_start, r.customer_code, sman_key)
+            agg = cust_month.setdefault(key, {"amount": 0.0, "invoices": set()})
+            agg["amount"] += float(r.amount)
+            agg["invoices"].add(r.invoice_no)
+
+            if pd.notna(r.category):
+                ckey = (r.month_start, r.customer_code, r.category)
+                cagg = cat_month.setdefault(ckey, {"amount": 0.0, "invoices": set()})
+                cagg["amount"] += float(r.amount)
+                cagg["invoices"].add(r.invoice_no)
+
+        cur.executemany(
+            """INSERT INTO monthly_sales (month_start, customer_code, salesman_key, category,
+                                          invoice_count, total_amount, source)
+               VALUES (%s,%s,%s,NULL,%s,%s,'upload')
+               ON CONFLICT (month_start, customer_code, salesman_key) DO UPDATE SET
+                 invoice_count = EXCLUDED.invoice_count, total_amount = EXCLUDED.total_amount, source='upload'""",
+            [(m, cc, sk, len(a["invoices"]), round(a["amount"], 2)) for (m, cc, sk), a in cust_month.items()],
+        )
+        cur.executemany(
+            """INSERT INTO monthly_sales_category (month_start, customer_code, category, invoice_count, total_amount)
+               VALUES (%s,%s,%s,%s,%s)
+               ON CONFLICT (month_start, customer_code, category) DO UPDATE SET
+                 invoice_count = EXCLUDED.invoice_count, total_amount = EXCLUDED.total_amount""",
+            [(m, cc, cat, len(a["invoices"]), round(a["amount"], 2)) for (m, cc, cat), a in cat_month.items()],
+        )
+
+    return {
+        "snapshot_id": snapshot_id,
+        "snapshot_date": str(inferred_date),
+        "snapshot_type": "monthly",
+        "item_rows": len(df),
+        "monthly_sales_rows": len(cust_month),
+        "monthly_sales_category_rows": len(cat_month),
+        "new_customers": len(new_customers),
+        "skipped_unmatched_salesman": skipped_salesman,
+    }
